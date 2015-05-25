@@ -334,29 +334,21 @@ def create_waf(self, *k, **kw):
 	reg = re.compile('^REVISION=(.*)', re.M)
 	code1 = reg.sub(r'REVISION="%s"' % REVISION, code1)
 
-	def find_unused(kd, ch):
-		for i in range(35, 125):
-			for j in range(35, 125):
-				if i==j: continue
-				if i == 39 or j == 39: continue
-				if i == 92 or j == 92: continue
-				s = chr(i) + chr(j)
-				if -1 == kd.find(s.encode()):
-					return (kd.replace(ch.encode(), s.encode()), s)
-		raise
-
-	# The reverse order prevents collisions
-	(cnt, C3) = find_unused(cnt, '\x00')
-	(cnt, C2) = find_unused(cnt, '\r')
-	(cnt, C1) = find_unused(cnt, '\n')
-	ccc = code1.replace("C1='x'", "C1='%s'" % C1).replace("C2='x'", "C2='%s'" % C2).replace("C3='x'", "C3='%s'" % C3)
+	# base64 encode the waf tar bundle
+	import base64
+	cnt_base64 = base64.b64encode(cnt)
 
 	f = open('waf', 'wb')
 	try:
-		f.write(ccc.encode())
+		f.write(code1.encode())
 		f.write(to_bytes('#==>\n#'))
-		f.write(cnt)
-		f.write(to_bytes('\n#<==\n'))
+
+		line_length = 120
+		for i in range(0, len(cnt_base64), line_length):
+			f.write(to_bytes("#"))
+			f.write(to_bytes(cnt_base64[i:i+line_length]))
+			f.write(to_bytes("\n"))
+		f.write(to_bytes('#<==\n'))
 
 		if Options.options.signed:
 			f.flush()
