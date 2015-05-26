@@ -6,8 +6,9 @@ Configuration - create a dictionary in your top level wscript file like so:
 pytools_options = {
     pyenv_dir: "<name of virtualenv directory - defaults to 'pyenv'>",
     sdists_dir: "<name of cached sdists directory - defaults to '.sdists'>",
-    setup_hook: <callable that is called before creating the virtualenv>,
-    pip_hook: <callable that is called after creating the virtualenv>,
+    setup_pre_hook: <optional callable that is called before creating the virtualenv>,
+    setup_pip_hook: <optional callable for pip installation>,
+    setup_post_hook: <optional callable that is called after the pip installs>
     sources: <list of relative paths from top level that are the project sources>,
     dbschema_hook: <callable that is called after creating/updating the dbschema>,
     manage: <python module string for the manage.py file>,
@@ -16,12 +17,15 @@ pytools_options = {
 
 Notes:
     - The pyenv_dir may be an absolute path.
-    - The setup_hook function should be used to do any system provisioning required - i.e. install
+    - The setup_pre_hook function should be used to do any system provisioning required - i.e. install
       packages with yum, run salt scripts, etc.
-    - The pip_hook function should be used to do pip installations. It is passed a build context parameter which will
-      have a pyd member that is a PyenvData instance. It's pyenv_install method should be used to install various
-      requirement text files using the local sdists cache.
-
+    - The setup_pip_hook function must be used to do only pip installations. It is passed a build context parameter
+      which will have a pyd member that is a PyenvData instance. It's pyenv_install method should be used to install
+      various requirement text files using the local sdists cache. It's also used by the sdists command, so it _must_
+      only do pip installations using the pyd.pyenv_install methods
+    - The setup_post_hook function should be used to do any additional non-pip initialization of the virtualenv.
+      For example, you could install node tools like casperjs into the virtualenv useing nodeenv. pip packages _must_
+      not be installed here.
 """
 import abc, os, pwd, tempfile
 
@@ -72,6 +76,7 @@ class PyenvData(object):
         self.pyenv_ = pyenv_path
         self.curruser = pwd.getpwuid(os.getuid()).pw_name
         self._sys_vardir = None
+        self.force_pyenv_install_download = False
 
     @property
     def pyenv(self):
@@ -189,8 +194,12 @@ class PyenvData(object):
         if paths:
             env["PATH"] = ":".join([env["PATH"]] + paths)
         args = [self.pip, "install", "-r", requirements]
-        if local_only:
-            args.extend(["--no-index", "--find-links=file://%s/.sdists" % self.ctx.path.abspath()])
+
+        if self.force_pyenv_install_download:
+            cache_only_dir = _sdists_dir(self.ctx)
+        else:
+            if local_only:
+                args.extend(["--no-index", "--find-links=file://%s/%s" % (self.ctx.path.abspath(), _sdists_dir(self.ctx))])
         if cache_only_dir:
             args.extend(["-d", cache_only_dir])
         self.ctx.exec_command(args, env=env)
@@ -288,11 +297,11 @@ class SetupCommand(ContextUtilsMixin, Configure.ConfigurationContext):
 
     def impl(self):
         """Implementation of the virtualenv creation logic"""
-        #1) call out to project specific system provisioning hook
-        setuphook = projopts_get(self, 'pytools', 'setup_hook', None, callfunc=False)
-        if setuphook:
-            self.start_msg("Running setup hook")
-            setuphook(self)
+        #1) call the pre-hook
+        prehook = projopts_get(self, "pytools", "setup_pre_hook", None, callfunc=False)
+        if prehook:
+            self.start_msg("Running setup pre-hook")
+            prehook(self)
             self.end_msg("ok")
 
         #2) create the virtualenv
@@ -305,9 +314,43 @@ class SetupCommand(ContextUtilsMixin, Configure.ConfigurationContext):
         self.pyd.pyenv_add_src_pth(_sources(self))
         self.end_msg("ok")
 
-        #4) call the pip-requirements installation hook
-        piphook = projopts_get(self, 'pytools', 'pip_hook', None, callfunc=False)
+        #4) call the pip-hook
+        piphook = projopts_get(self, "pytools", "setup_pip_hook", None, callfunc=False)
         if piphook:
             self.start_msg("Running pip installations")
             piphook(self)
             self.end_msg("ok")
+
+        #5) call the post-hook
+        posthook = projopts_get(self, "pytools", "setup_post_hook", None, callfunc=False)
+        if posthook:
+            self.start_msg("Running setup post-hook")
+            posthook(self)
+            self.end_msg("ok")
+
+
+class SyncSdistsCommand(CustomBuildCommandMixin, Build.BuildContext):
+    """Download source dists for all pip dependencies"""
+    cmd = "sdists"
+    def impl(self):
+        # wipe out everything in the project sdists directory
+        sdists = _sdists_dir(self)
+        sdistdir = os.path.join(self.path.abspath(), sdists)
+        for f in os.listdir(sdistdir):
+            if not f.startswith("."):
+                fpath = os.path.join(sdistdir, f)
+                if os.path.isfile(fpath):
+                    os.unlink(fpath)
+
+        # pip still runs the configure scripts and needs to be able to find the psql tools even in the download case,
+        # so supply the extra paths to run with
+        self.start_msg("Downloading current pyenv package sources")
+        piphook = projopts_get(self, "pytools", "setup_pip_hook", None, callfunc=False)
+        if piphook is None:
+            raise Exception("You must define a pip_hook function to run sdists")
+
+        old_force_pyenv_install_download = self.pyd.force_pyenv_install_download
+        self.pyd.force_pyenv_install_download = True
+        piphook(self)
+        self.pyd.force_pyenv_install_download = old_force_pyenv_install_download
+        self.end_msg("ok")
