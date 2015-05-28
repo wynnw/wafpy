@@ -11,8 +11,12 @@ pytools_options = {
     setup_post_hook: <optional callable that is called after the pip installs>
     sources: <list of relative paths from top level that are the project sources>,
     dbschema_hook: <callable that is called after creating/updating the dbschema>,
+    pylint_ignores: <list of python filenames to ignore in pylint>,
+    pylint_extensions: <dict of pylintrc settings -> strings>,
     manage: <python module string for the manage.py file>,
     sys_vardir: <callable that returns the path to the system var directory>,
+    pg_dev_docker_name: <name>,
+    pg_test_docker_name: <name>,
 }
 
 Notes:
@@ -26,13 +30,18 @@ Notes:
     - The setup_post_hook function should be used to do any additional non-pip initialization of the virtualenv.
       For example, you could install node tools like casperjs into the virtualenv useing nodeenv. pip packages _must_
       not be installed here.
+    - pylint_extensions must be a dict like this:
+      { "generated-members": "objects,foo,etc" }
 """
-import abc, os, pwd, tempfile
+import abc, os, pwd, subprocess, tempfile
 
 from waflib import Build, Configure, Context, Errors, Logs, Options  #pylint: disable=F0401
 from .utils import projopts_get
 
 
+########################################################################################################################
+# waf integrations
+########################################################################################################################
 def options(ctx):
     """Add command line options for the build"""
     ctx.add_option("--localdir", action="store", default=None,
@@ -57,7 +66,9 @@ def configure(ctx):
     ctx.check_python_version()
 
 
-## Internal methods for looking up pytools options
+########################################################################################################################
+# internal utilities
+########################################################################################################################
 def _sources(ctx):
     return projopts_get(ctx, 'pytools', 'sources', ())
 
@@ -68,6 +79,17 @@ def _pyenv_dir(ctx):
 
 def _sdists_dir(ctx):
     return projopts_get(ctx, 'pytools', 'sdists_dir', '.sdists')
+
+def _manage(ctx):
+    return projopts_get(ctx, 'pytools', 'manage', None)
+
+
+def _docker_dev(ctx):
+    return projopts_get(ctx, 'pytools', 'pg_dev_docker_name', None)
+
+
+def _docker_test(ctx):
+    return projopts_get(ctx, 'pytools', 'pg_test_docker_name', None)
 
 
 class PyenvData(object):
@@ -97,6 +119,7 @@ class PyenvData(object):
     def pythondir(self):
         pycmd = "from distutils.sysconfig import get_python_lib; print get_python_lib()"
         return self.ctx.cmd_and_log([self.python, '-c', pycmd], output=Context.STDOUT).strip()
+
     def var(self, subdir):
         """Return the path to the subdir in the pyenv var directory"""
         varpath = os.path.join(self.pyenv, "var", subdir)
@@ -196,6 +219,8 @@ class PyenvData(object):
         args = [self.pip, "install", "-r", requirements]
 
         if self.force_pyenv_install_download:
+            if not local_only:  # only do this for calls that want the cached sdists
+                return
             cache_only_dir = _sdists_dir(self.ctx)
         else:
             if local_only:
@@ -204,19 +229,16 @@ class PyenvData(object):
             args.extend(["-d", cache_only_dir])
         self.ctx.exec_command(args, env=env)
 
-    def pyenv_add_src_pth(self, extra_paths=None):
-        if extra_paths is None: extra_paths = []
+    def pyenv_add_src_pth(self, sources):
         pythondir = self.pythondir
         relpath = os.path.relpath(self.ctx.path.abspath(), pythondir)
         projname = os.path.basename(self.ctx.path.abspath())
         with open(os.path.join(pythondir, projname + ".pth"), "w") as pth:
-            pth.write(relpath + "\n")
-            for extra_path in extra_paths:
-                pth.write(relpath + '/' + extra_path + "\n")
+            for source in sources:
+                pth.write(relpath + '/' + source + "\n")
 
     def pyenv_collectstatic(self):
-        mm = projopts_get(self.ctx, 'pytools', 'manage', None)
-        self.ctx.exec_command([self.python, '-m', mm, 'collectstatic', '--noinput'])
+        self.ctx.exec_command([self.python, '-m', _manage(self.ctx), 'collectstatic', '--noinput'])
 
 
 class PythonCleanCommand(Build.CleanContext):
@@ -267,6 +289,9 @@ class CustomBuildCommandMixin(ContextUtilsMixin):
     def impl(self): pass
 
 
+########################################################################################################################
+# virtualenv management commands
+########################################################################################################################
 class SetupCommand(ContextUtilsMixin, Configure.ConfigurationContext):
     """Setup the pyenv environment"""
     cmd = "setup"
@@ -314,6 +339,11 @@ class SetupCommand(ContextUtilsMixin, Configure.ConfigurationContext):
         self.pyd.pyenv_add_src_pth(_sources(self))
         self.end_msg("ok")
 
+        #4) install a custom pylintrc to the pyenv/etc dir for the pylint command
+        self.start_msg("Installing project pylintrc")
+        self._create_pylintrc()
+        self.end_msg("ok")
+
         #4) call the pip-hook
         piphook = projopts_get(self, "pytools", "setup_pip_hook", None, callfunc=False)
         if piphook:
@@ -327,6 +357,20 @@ class SetupCommand(ContextUtilsMixin, Configure.ConfigurationContext):
             self.start_msg("Running setup post-hook")
             posthook(self)
             self.end_msg("ok")
+
+    def _create_pylintrc(self):
+        base_pylintrc = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pylintrc")
+        dest_pylintrc = os.path.join(self.pyd.etc, "pylintrc")
+        extensions = projopts_get(self, "pytools", "pylint_extensions", None)
+        with open(base_pylintrc, "r") as src:
+            with open(dest_pylintrc, "w") as out:
+                for line in src:
+                    parts = line.split('=', 2)
+                    if len(parts) == 2 and extensions is not None:
+                        varname = parts[0].strip()
+                        if varname in extensions:
+                            line = line.rstrip() + extensions[varname] + '\n'
+                    out.write(line)
 
 
 class SyncSdistsCommand(CustomBuildCommandMixin, Build.BuildContext):
@@ -353,4 +397,84 @@ class SyncSdistsCommand(CustomBuildCommandMixin, Build.BuildContext):
         self.pyd.force_pyenv_install_download = True
         piphook(self)
         self.pyd.force_pyenv_install_download = old_force_pyenv_install_download
+        self.end_msg("ok")
+
+
+########################################################################################################################
+# database management commands
+########################################################################################################################
+class SchemaUpdateCommand(CustomBuildCommandMixin, Build.BuildContext):
+    """Update the django migrations with latest model changes"""
+    # note - this can't be used for the initial migrations, as makemigrations doesn't create the initial migrations
+    # this is just for updates
+    cmd = 'schemaupdate'
+
+    # pylint: disable=E1002,E1101
+    def compile(self):
+        self.ctx.exec_command([self.python, '-m', _manage(self), 'makemigrations', '--noinput'])
+        super(SchemaUpdateCommand, self).compile()
+
+
+class StopdbCommand(CustomBuildCommandMixin, Build.BuildContext):
+    """Stop the running dev postgres docker instance"""
+    cmd = "stopdb"
+    def impl(self):
+        dbimage = _docker_dev(self)
+        self.start_msg("Stopping dev postgres docker image")
+        self.exec_command(["sudo", "-H", "docker", "stop", dbimage])
+        self.exec_command(["sudo", "-H", "docker", "rm", dbimage])
+        self.end_msg("ok")
+
+
+########################################################################################################################
+# testing commands
+########################################################################################################################
+class PylintCommand(CustomBuildCommandMixin, Build.BuildContext):
+    """Run pylint on python modules"""
+    cmd = "pylint"
+    ignores = ["unicode_csv.py", "crontab.py"]  # 3rd party code we don't want to fix for pylint
+    def exec_command(self, cmd, **kwargs):
+        if Options.options.stdout:
+            ret = subprocess.call(cmd, **kwargs)
+            if ret != 0:
+                raise Errors.WafError("command(%r) failed with code(%r)" % (cmd, ret))
+        else:
+            super(PylintCommand, self).exec_command(cmd, **kwargs)
+
+    def _modules(self):
+        return _sources(self) if Options.options.mod is None else Options.options.mod.split(",")
+
+    def impl(self):
+        modules = self._modules()
+        ignores = projopts_get(self, 'pytools', 'pylint_ignores', ())
+        self.start_msg("Running pylint on: " + ",".join(modules))
+        args = [self.pyd.pylint, "-f", "text", "-r", "n", "--rcfile=%s/pylintrc" % self.pyd.etc]
+        if len(ignores) > 0:
+            args.append("--ignore=" + ",".join(ignores))
+        for mod in modules:
+            self.exec_command(args + [mod])
+        self.end_msg("ok")
+
+
+class PyflakesCommand(PylintCommand):
+    """Run pyflakes on python sources"""
+    cmd = "pyflakes"
+
+    def impl(self):
+        modules = self._modules()
+        self.start_msg("Running pyflakes on: " + ",".join(modules))
+        args = [self.pyd.prog("pyflakes")]
+        for mod in modules:
+            self.exec_command(args + [mod.replace(".", "/")])
+        self.end_msg("ok")
+
+
+class PylintBuildCommand(CustomBuildCommandMixin, Build.BuildContext):
+    """Run pylint on the build wscript"""
+    cmd = "pylint-build"
+    def impl(self):
+        self.start_msg("Running pylint on build wscript")
+        args = [self.pyd.pylint, "-f", "text", "-r", "n", "--rcfile=%s/.pylintrc-wscript" % self.path.abspath(),
+                                 "wscript"]
+        self.exec_command(args)
         self.end_msg("ok")
