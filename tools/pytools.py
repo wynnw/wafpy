@@ -6,18 +6,19 @@ Configuration - create a dictionary in your top level wscript file like so:
 pytools_options = {
     pyenv_dir: "<name of virtualenv directory - defaults to 'pyenv'>",
     sdists_dir: "<name of cached sdists directory - defaults to '.sdists'>",
+    app_module: <python module string that for module that contains the manage.py, settings.py, etc.>
+    sources: <list of relative paths from top level that are the project sources>,
+    dbschema_modules: <list of django app names that should be processed for migrations>,
+
     setup_pre_hook: <optional callable that is called before creating the virtualenv>,
     setup_pip_hook: <optional callable for pip installation>,
     setup_post_hook: <optional callable that is called after the pip installs>
-    sources: <list of relative paths from top level that are the project sources>,
-    dbschema_hook: <callable that is called after creating/updating the dbschema>,
-    dbschema_modules: <list of django app names that should be processed for migrations>,
+    dbschema_hook: <callable that is called after running schemaupdate>,
+    dbmigrate_hook: <callable that is called after running migrate>,
+    dbinit_hook: <callable that is used to perform database initialization for dbinit>,
+
     pylint_ignores: <list of python filenames to ignore in pylint>,
     pylint_extensions: <dict of pylintrc settings -> strings>,
-    app_module: <python module string that for module that contains the manage.py, settings.py, etc.>
-    sys_vardir: <callable that returns the path to the system var directory>,
-    pg_dev_docker_name: <name>,
-    pg_test_docker_name: <name>,
 }
 
 Notes:
@@ -90,14 +91,6 @@ def _app_module(ctx):
     return projopts_get(ctx, 'pytools', 'app_module', None)
 
 
-def _docker_dev(ctx):
-    return projopts_get(ctx, 'pytools', 'pg_dev_docker_name', None)
-
-
-def _docker_test(ctx):
-    return projopts_get(ctx, 'pytools', 'pg_test_docker_name', None)
-
-
 def _dbschema_modules(ctx):
     return projopts_get(ctx, 'pytools', 'dbschema_modules', [])
 
@@ -107,7 +100,6 @@ class PyenvData(object):
         self.ctx = ctx
         self.pyenv_ = pyenv_path
         self.curruser = pwd.getpwuid(os.getuid()).pw_name
-        self._sys_vardir = None
         self.force_pyenv_install_download = False
 
     @property
@@ -191,14 +183,6 @@ class PyenvData(object):
         return self.prog("pylint")
 
     @property
-    def sys_vardir(self):
-        if self._sys_vardir is None:
-            self._sys_vardir = projopts_get(self.ctx, "pytools", "sys_vardir", None)
-            if self._sys_vardir is None:
-                raise Exception("You must define the wscript pytools[sys_vardir] configuration option")
-        return self._sys_vardir
-
-    @property
     def uwsgi_pid(self):
         return os.path.join(self.vardir, "uwsgi.pid")
 
@@ -252,11 +236,19 @@ class PyenvData(object):
         relpath = os.path.relpath(self.ctx.path.abspath(), pythondir)
         projname = os.path.basename(self.ctx.path.abspath())
         with open(os.path.join(pythondir, projname + ".pth"), "w") as pth:
+            pth_paths = set()
             for source in sources:
-                pth.write(relpath + '/' + source + "\n")
+                pth_paths.add(os.path.dirname(os.path.join(relpath, source)))
+
+            for pth_path in pth_paths:
+                pth.write(pth_path)
+                pth.write("\n")
+
+    def django_manage_args(self):
+        return [self.python, "-m", _manage(self.ctx)]
 
     def pyenv_collectstatic(self):
-        self.ctx.exec_command([self.python, '-m', _manage(self.ctx), 'collectstatic', '--noinput'])
+        self.ctx.exec_command(self.django_manage_args + ["collectstatic", "--noinput"])
 
 
 class PythonCleanCommand(Build.CleanContext):
@@ -325,6 +317,7 @@ class SetupCommand(ContextUtilsMixin, Configure.ConfigurationContext):
         self.run_impl(self.impl)  # run our setup logic
         super(SetupCommand, self).execute()  # run the actual configure command (calls the configure() function)
 
+
     def _set_out_dir(self):
         """runs to determine if we need to have a build/pyenv prefix if the srcroot is from a network share"""
         if Options.options.localdir or self.pyd.shared_srcroot:
@@ -363,14 +356,14 @@ class SetupCommand(ContextUtilsMixin, Configure.ConfigurationContext):
         self._create_pylintrc()
         self.end_msg("ok")
 
-        #4) call the pip-hook
+        #5) call the pip-hook
         piphook = projopts_get(self, "pytools", "setup_pip_hook", None, callfunc=False)
         if piphook:
             self.start_msg("Running pip installations")
             piphook(self)
             self.end_msg("ok")
 
-        #5) call the post-hook
+        # 6) call the post hook
         posthook = projopts_get(self, "pytools", "setup_post_hook", None, callfunc=False)
         if posthook:
             self.start_msg("Running setup post-hook")
@@ -546,45 +539,71 @@ class StopCommand(CustomBuildCommandMixin, Build.BuildContext):
 ########################################################################################################################
 # postgres database commands
 ########################################################################################################################
-class StartdbCommand(CustomBuildCommandMixin, Build.BuildContext):
+class DbstartCommand(CustomBuildCommandMixin, Build.BuildContext):
     """Setup a dev postgres docker instance"""
-    cmd = "startdb"
+    cmd = "dbstart"
     action = "start"
 
     def impl(self):
         self.pyd.activate()
 
-        self.start_msg("dev postgres docker image (%s)" % self.action)
+        self.start_msg("running %s on dev postgres docker image" % self.action)
         self.exec_command(["python", "-m", _app_module(self) + ".djangoapp.pgdocker", self.action])
         self.end_msg("ok")
 
 
-class StopdbCommand(StartdbCommand):
+class DbstopCommand(DbstartCommand):
     """Stop the running dev postgres docker instance"""
-    cmd = "stopdb"
+    cmd = "dbstop"
     action = "stop"
 
 
-class SchemaUpdateCommand(CustomBuildCommandMixin, Build.BuildContext):
+class DbschemaCommand(CustomBuildCommandMixin, Build.BuildContext):
     """Update the django migrations with latest model changes"""
     # note - this can't be used for the initial migrations, as makemigrations doesn't create the initial migrations
     # this is just for updates
-    cmd = 'schemaupdate'
+    cmd = 'dbschema'
 
     def impl(self):
         for schema_mod in _dbschema_modules(self):
             self.start_msg("Running makemigrations for " + schema_mod)
-            self.exec_command([self.pyd.python, '-m', _manage(self), 'makemigrations', '--noinput', schema_mod])
+            self.exec_command(self.pyd.django_manage_args() + ['makemigrations', '--noinput', schema_mod])
+            self.end_msg("ok")
+
+        hook = projopts_get(self, "pytools", "dbschema_hook", None, callfunc=False)
+        if hook:
+            self.start_msg("Running dbschema hook")
+            hook(self)
             self.end_msg("ok")
 
 
-class MigrateCommand(CustomBuildCommandMixin, Build.BuildContext):
+class DbmigrateCommand(CustomBuildCommandMixin, Build.BuildContext):
     """Apply django migrations"""
-    cmd = 'migrate'
+    cmd = 'dbmigrate'
 
     def impl(self):
+        self.start_msg("Running default migrations")
+        self.exec_command([self.pyd.python, '-m', _manage(self), 'migrate', "--database=admin", '--noinput'])
+        self.end_msg("ok")
+
         for schema_mod in _dbschema_modules(self):
             self.start_msg("Running migrate for " + schema_mod)
             self.exec_command([self.pyd.python, '-m', _manage(self), 'migrate', "--database=admin", '--noinput',
                                                 schema_mod])
             self.end_msg("ok")
+
+        hook = projopts_get(self, "pytools", "dbmigrate_hook", None, callfunc=False)
+        if hook:
+            self.start_msg("Running dbmigrate hook")
+            hook(self)
+            self.end_msg("ok")
+
+
+class DbinitCommand(CustomBuildCommandMixin, Build.BuildContext):
+    """Perform initialize and setup of database"""
+    cmd = 'dbinit'
+
+    def impl(self):
+        hook = projopts_get(self, "pytools", "dbinit_hook", None, callfunc=False)
+        if hook:
+            hook(self)
