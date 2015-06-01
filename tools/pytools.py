@@ -11,6 +11,7 @@ pytools_options = {
     setup_post_hook: <optional callable that is called after the pip installs>
     sources: <list of relative paths from top level that are the project sources>,
     dbschema_hook: <callable that is called after creating/updating the dbschema>,
+    dbschema_modules: <list of django app names that should be processed for migrations>,
     pylint_ignores: <list of python filenames to ignore in pylint>,
     pylint_extensions: <dict of pylintrc settings -> strings>,
     app_module: <python module string that for module that contains the manage.py, settings.py, etc.>
@@ -95,6 +96,10 @@ def _docker_dev(ctx):
 
 def _docker_test(ctx):
     return projopts_get(ctx, 'pytools', 'pg_test_docker_name', None)
+
+
+def _dbschema_modules(ctx):
+    return projopts_get(ctx, 'pytools', 'dbschema_modules', [])
 
 
 class PyenvData(object):
@@ -566,7 +571,20 @@ class SchemaUpdateCommand(CustomBuildCommandMixin, Build.BuildContext):
     # this is just for updates
     cmd = 'schemaupdate'
 
-    # pylint: disable=E1002,E1101
-    def compile(self):
-        self.ctx.exec_command([self.python, '-m', _manage(self), 'makemigrations', '--noinput'])
-        super(SchemaUpdateCommand, self).compile()
+    def impl(self):
+        for schema_mod in _dbschema_modules(self):
+            self.start_msg("Running makemigrations for " + schema_mod)
+            self.exec_command([self.pyd.python, '-m', _manage(self), 'makemigrations', '--noinput', schema_mod])
+            self.end_msg("ok")
+
+
+class MigrateCommand(CustomBuildCommandMixin, Build.BuildContext):
+    """Apply django migrations"""
+    cmd = 'migrate'
+
+    def impl(self):
+        for schema_mod in _dbschema_modules(self):
+            self.start_msg("Running migrate for " + schema_mod)
+            self.exec_command([self.pyd.python, '-m', _manage(self), 'migrate', "--database=admin", '--noinput',
+                                                schema_mod])
+            self.end_msg("ok")
