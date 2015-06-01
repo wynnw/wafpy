@@ -13,7 +13,7 @@ pytools_options = {
     dbschema_hook: <callable that is called after creating/updating the dbschema>,
     pylint_ignores: <list of python filenames to ignore in pylint>,
     pylint_extensions: <dict of pylintrc settings -> strings>,
-    manage: <python module string for the manage.py file>,
+    app_module: <python module string that for module that contains the manage.py, settings.py, etc.>
     sys_vardir: <callable that returns the path to the system var directory>,
     pg_dev_docker_name: <name>,
     pg_test_docker_name: <name>,
@@ -33,7 +33,7 @@ Notes:
     - pylint_extensions must be a dict like this:
       { "generated-members": "objects,foo,etc" }
 """
-import abc, os, pwd, subprocess, tempfile
+import abc, os, pwd, signal, subprocess, tempfile
 
 from waflib import Build, Configure, Context, Errors, Logs, Options  #pylint: disable=F0401
 from .utils import projopts_get
@@ -80,8 +80,13 @@ def _pyenv_dir(ctx):
 def _sdists_dir(ctx):
     return projopts_get(ctx, 'pytools', 'sdists_dir', '.sdists')
 
+
 def _manage(ctx):
-    return projopts_get(ctx, 'pytools', 'manage', None)
+    return _app_module(ctx) + ".manage"
+
+
+def _app_module(ctx):
+    return projopts_get(ctx, 'pytools', 'app_module', None)
 
 
 def _docker_dev(ctx):
@@ -120,9 +125,13 @@ class PyenvData(object):
         pycmd = "from distutils.sysconfig import get_python_lib; print get_python_lib()"
         return self.ctx.cmd_and_log([self.python, '-c', pycmd], output=Context.STDOUT).strip()
 
+    @property
+    def vardir(self):
+        return os.path.join(self.pyenv, "var")
+
     def var(self, subdir):
         """Return the path to the subdir in the pyenv var directory"""
-        varpath = os.path.join(self.pyenv, "var", subdir)
+        varpath = os.path.join(self.vardir, subdir)
         if not os.path.exists(varpath):
             os.makedirs(varpath, mode=0755)
         return varpath
@@ -184,6 +193,10 @@ class PyenvData(object):
                 raise Exception("You must define the wscript pytools[sys_vardir] configuration option")
         return self._sys_vardir
 
+    @property
+    def uwsgi_pid(self):
+        return os.path.join(self.vardir, "uwsgi.pid")
+
     def activate(self):
         f = self.prog("activate_this.py")
         execfile(f, dict(__file__=f))
@@ -244,6 +257,7 @@ class PyenvData(object):
 class PythonCleanCommand(Build.CleanContext):
     """Override for the builtin clean command that also deletes pyc files"""
     cmd = "clean"
+
     def clean(self):  #pylint: disable=E1002
         super(PythonCleanCommand, self).clean()
 
@@ -376,6 +390,7 @@ class SetupCommand(ContextUtilsMixin, Configure.ConfigurationContext):
 class SyncSdistsCommand(CustomBuildCommandMixin, Build.BuildContext):
     """Download source dists for all pip dependencies"""
     cmd = "sdists"
+
     def impl(self):
         # wipe out everything in the project sdists directory
         sdists = _sdists_dir(self)
@@ -401,38 +416,13 @@ class SyncSdistsCommand(CustomBuildCommandMixin, Build.BuildContext):
 
 
 ########################################################################################################################
-# database management commands
-########################################################################################################################
-class SchemaUpdateCommand(CustomBuildCommandMixin, Build.BuildContext):
-    """Update the django migrations with latest model changes"""
-    # note - this can't be used for the initial migrations, as makemigrations doesn't create the initial migrations
-    # this is just for updates
-    cmd = 'schemaupdate'
-
-    # pylint: disable=E1002,E1101
-    def compile(self):
-        self.ctx.exec_command([self.python, '-m', _manage(self), 'makemigrations', '--noinput'])
-        super(SchemaUpdateCommand, self).compile()
-
-
-class StopdbCommand(CustomBuildCommandMixin, Build.BuildContext):
-    """Stop the running dev postgres docker instance"""
-    cmd = "stopdb"
-    def impl(self):
-        dbimage = _docker_dev(self)
-        self.start_msg("Stopping dev postgres docker image")
-        self.exec_command(["sudo", "-H", "docker", "stop", dbimage])
-        self.exec_command(["sudo", "-H", "docker", "rm", dbimage])
-        self.end_msg("ok")
-
-
-########################################################################################################################
 # testing commands
 ########################################################################################################################
 class PylintCommand(CustomBuildCommandMixin, Build.BuildContext):
     """Run pylint on python modules"""
     cmd = "pylint"
     ignores = ["unicode_csv.py", "crontab.py"]  # 3rd party code we don't want to fix for pylint
+
     def exec_command(self, cmd, **kwargs):
         if Options.options.stdout:
             ret = subprocess.call(cmd, **kwargs)
@@ -472,9 +462,111 @@ class PyflakesCommand(PylintCommand):
 class PylintBuildCommand(CustomBuildCommandMixin, Build.BuildContext):
     """Run pylint on the build wscript"""
     cmd = "pylint-build"
+
     def impl(self):
         self.start_msg("Running pylint on build wscript")
         args = [self.pyd.pylint, "-f", "text", "-r", "n", "--rcfile=%s/.pylintrc-wscript" % self.path.abspath(),
                                  "wscript"]
         self.exec_command(args)
         self.end_msg("ok")
+
+
+########################################################################################################################
+# uwsgi commands
+########################################################################################################################
+def _is_uwsgi_running(ctx):
+    pidfile = ctx.pyd.uwsgi_pid
+    running = False
+    if os.path.exists(pidfile):
+        pid = int(open(pidfile, "r").read().strip())
+        try:
+            os.kill(pid, 0)
+            running = True
+        except OSError:
+            os.unlink(pidfile)
+    return running
+
+
+class StartCommand(CustomBuildCommandMixin, Build.BuildContext):
+    """Start the uwsgi server as a daemon"""
+    cmd = "start"
+
+    def impl(self):
+        self.start_msg("Starting uwsgi in daemonize mode")
+        if _is_uwsgi_running(self):
+            self.end_msg("ok - already running")
+            return
+        confpath = os.path.join(self.pyd.vardir, "conf/uwsgi.conf")
+        self.exec_command([self.pyd.prog("uwsgi"), "--ini", confpath,
+                                                   "--daemonize", os.path.join(self.pyd.log, "uwsgi.log")])
+        self.end_msg("ok")
+
+
+class StartdevCommand(CustomBuildCommandMixin, Build.BuildContext):
+    """Start the uwsgi server for dev mode (i.e. simulate django runserver)"""
+    cmd = "startdev"
+
+    def impl(self):
+        self.start_msg("Starting uwsgi in dev mode (current process is replaced)")
+        if _is_uwsgi_running(self):
+            self.end_msg("failed - already running, run ./waf stop")
+            return
+
+        confpath = os.path.join(self.pyd.vardir, "conf/uwsgi-dev.conf")
+        uwsgi = self.pyd.prog("uwsgi")
+        os.execv(uwsgi, [uwsgi, "--ini", confpath])
+
+
+class StopCommand(CustomBuildCommandMixin, Build.BuildContext):
+    """Start the uwsgi server as a daemon"""
+    cmd = "stop"
+
+    def impl(self):
+        self.start_msg("Stopping dev uwsgi")
+        if not _is_uwsgi_running(self):
+            self.end_msg("ok - not running")
+            return
+        pidfile = self.pyd.uwsgi_pid
+        pid = int(open(pidfile, "r").read().strip())
+        try:
+            os.kill(pid, signal.SIGQUIT)  # uwsgi docs say use quit signal to shutdown
+            while True:
+                os.kill(pid, 0)
+        except OSError:
+            if os.path.exists(pidfile):
+                os.unlink(pidfile)
+        self.end_msg("ok")
+
+
+########################################################################################################################
+# postgres database commands
+########################################################################################################################
+class StartdbCommand(CustomBuildCommandMixin, Build.BuildContext):
+    """Setup a dev postgres docker instance"""
+    cmd = "startdb"
+    action = "start"
+
+    def impl(self):
+        self.pyd.activate()
+
+        self.start_msg("dev postgres docker image (%s)" % self.action)
+        self.exec_command(["python", "-m", _app_module(self) + ".djangoapp.pgdocker", self.action])
+        self.end_msg("ok")
+
+
+class StopdbCommand(StartdbCommand):
+    """Stop the running dev postgres docker instance"""
+    cmd = "stopdb"
+    action = "stop"
+
+
+class SchemaUpdateCommand(CustomBuildCommandMixin, Build.BuildContext):
+    """Update the django migrations with latest model changes"""
+    # note - this can't be used for the initial migrations, as makemigrations doesn't create the initial migrations
+    # this is just for updates
+    cmd = 'schemaupdate'
+
+    # pylint: disable=E1002,E1101
+    def compile(self):
+        self.ctx.exec_command([self.python, '-m', _manage(self), 'makemigrations', '--noinput'])
+        super(SchemaUpdateCommand, self).compile()
